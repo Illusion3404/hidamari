@@ -62,8 +62,8 @@ def generate_thumbnail(filename):
 
 def get_thumbnail(video_path, list_store, idx):
     # Best-effort: a preview thumbnail must never crash the GUI. On failure the
-    # generic video icon set by the caller stays in place. (In the Flatpak the
-    # sandboxed thumbnailer can fail; that's fine, we just skip the preview.)
+    # generic video icon set by the caller stays in place. The ListStore is a
+    # GTK object, so only update it from the GTK main loop, not this worker.
     try:
         info = Gio.File.new_for_path(video_path).query_info(
             "thumbnail::path", Gio.FileQueryInfoFlags.NONE, None
@@ -72,7 +72,18 @@ def get_thumbnail(video_path, list_store, idx):
             video_path
         )
         if thumbnail:
-            list_store[idx][0] = GdkPixbuf.Pixbuf.new_from_file_at_size(thumbnail, -1, 96)
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(thumbnail, -1, 96)
+
+            def apply_thumbnail():
+                try:
+                    tree_iter = list_store.iter_nth_child(None, idx)
+                    if tree_iter is not None:
+                        list_store.set_value(tree_iter, 0, pixbuf)
+                except (GLib.Error, IndexError, TypeError) as error:
+                    logger.debug("[Thumbnail] Could not update row %s: %s", idx, error)
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(apply_thumbnail)
     except (GLib.Error, OSError, subprocess.SubprocessError) as e:
         logger.debug("[Thumbnail] Skipped %s: %s", os.path.basename(video_path), e)
 

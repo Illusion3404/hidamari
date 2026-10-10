@@ -279,9 +279,9 @@ class ControlPanel(Gtk.Application):
         paths = self.config[CONFIG_KEY_DATA_SOURCE] if not None else []
         # all option
         if monitor == self.all_key:
-            for name, monitor in self.monitors.get_monitors().items():
+            for name, display_monitor in self.monitors.get_monitors().items():
                 paths[name] = video_path
-                monitor.set_wallpaper(video_path)
+                display_monitor.set_wallpaper(video_path)
         else:
             paths[monitor.name] = video_path
             self.monitors.get_monitor(monitor.name).set_wallpaper(video_path)
@@ -291,7 +291,8 @@ class ControlPanel(Gtk.Application):
         self.config[CONFIG_KEY_DATA_SOURCE] = paths
         self._save_config()
         if self.server is not None:
-            self.server.video(video_path, monitor.name)
+            selected_monitor = monitor.name if monitor != self.all_key else None
+            self.server.video(video_path, selected_monitor)
 
     def on_local_web_page_apply(self, *_args):
         file_chooser: Gtk.FileChooserButton = self.builder.get_object("FileChooser")
@@ -417,7 +418,7 @@ class ControlPanel(Gtk.Application):
     def _check_url(self, url):
         # Check if the url is valid
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=(3.05, 10))
         except requests.exceptions.RequestException as e:
             logger.error(f"[GUI] Failed to access {url}. Error:\n{e}")
             self._show_error(_("Failed to access {url}. Error:\n{error}").format(url=url, error=e))
@@ -500,9 +501,6 @@ class ControlPanel(Gtk.Application):
         self.set_mute_toggle_icon()
         self.set_scale_volume_sensitive()
         self.set_spin_blur_radius_sensitive()
-        toggle_mute: Gtk.ToggleButton = self.builder.get_object("ToggleMute")
-        toggle_mute.set_state = self.config[CONFIG_KEY_MUTE]
-
         scale_volume: Gtk.Scale = self.builder.get_object("ScaleVolume")
         adjustment_volume: Gtk.Adjustment = self.builder.get_object("AdjustmentVolume")
         # Temporary block signal
@@ -517,9 +515,6 @@ class ControlPanel(Gtk.Application):
         spin_blur_radius.set_value(self.config[CONFIG_KEY_BLUR_RADIUS])
         adjustment_blur.handler_unblock_by_func(self.on_blur_radius_changed)
 
-        toggle_mute: Gtk.ToggleButton = self.builder.get_object("ToggleAutostart")
-        toggle_mute.set_state = self.is_autostart
-
     def _reload_icon_view(self, *_):
         self.video_paths = get_video_paths()
         list_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str)
@@ -528,12 +523,22 @@ class ControlPanel(Gtk.Application):
         self.icon_view.set_text_column(1)
         self.icon_view.set_model(list_store)
         self.icon_view.connect("button-press-event", self.on_icon_view_button_press)
-        for idx, video_path in enumerate(self.video_paths):
+        for video_path in self.video_paths:
             pixbuf = Gtk.IconTheme().get_default().load_icon("video-x-generic", 96, 0)
             list_store.append([pixbuf, os.path.basename(video_path)])
-            thread = threading.Thread(target=get_thumbnail, args=(video_path, list_store, idx))
-            thread.daemon = True
+
+        # Thumbnail extraction can use significant CPU on older APUs. Use a
+        # single background worker rather than starting one thread per file.
+        if self.video_paths:
+            thread = threading.Thread(
+                target=self._load_thumbnails, args=(self.video_paths, list_store), daemon=True
+            )
             thread.start()
+
+    @staticmethod
+    def _load_thumbnails(video_paths, list_store):
+        for idx, video_path in enumerate(video_paths):
+            get_thumbnail(video_path, list_store, idx)
 
 
 def _find_gresource(pkgdatadir):

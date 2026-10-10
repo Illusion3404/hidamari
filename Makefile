@@ -18,10 +18,13 @@ run: install ## Install into PREFIX and run it in debug mode (via the uv env)
 	uv run python $(PREFIX)/bin/hidamari -d
 
 lint: ## Lint the sources with ruff
-	uv run ruff check src/
+	uv run ruff check src/ tests/
+
+test: ## Run the dependency-light unit tests
+	PYTHONPATH=src python3 -m unittest discover -s tests
 
 format: ## Auto-format the sources with ruff
-	uv run ruff format src/
+	uv run ruff format src/ tests/
 
 # --- Meson build ------------------------------------------------------------
 
@@ -69,4 +72,4 @@ help: ## Show this help
 		| sort \
 		| awk 'BEGIN {FS = ":.*?## "} {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-.PHONY: sync run lint format build install uninstall pot update-po pypi-deps flatpak clean help
+.PHONY: sync run lint test format build install uninstall pot update-po pypi-deps flatpak clean help

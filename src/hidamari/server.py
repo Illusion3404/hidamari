@@ -3,7 +3,6 @@ import multiprocessing as mp
 import random
 import signal
 import time
-from multiprocessing import Process
 
 import setproctitle
 from gi.repository import GLib
@@ -82,10 +81,10 @@ class HidamariServer:
         self._prev_mode = None
         self._player_count = 0
 
-        # Processes
-        # Switch to `forkserver` since v3.2 for performance. BTW `fork` didn't work (it crashes).
-        # Ref: https://bnikolic.co.uk/blog/python/parallelism/2019/11/13/python-forkserver-preload.html
-        mp.set_start_method("forkserver")
+        # Use a per-application forkserver context instead of changing the
+        # process-wide multiprocessing start method. This remains predictable
+        # when embedded or launched from another Python application.
+        self.mp_context = mp.get_context("forkserver")
         self.gui_process = None
         self.sys_icon_process = None
         self.player_process = None
@@ -122,10 +121,13 @@ class HidamariServer:
         logger.info(f"[Mode] {mode}")
         self.config[CONFIG_KEY_MODE] = mode
 
-        # Set data source if specified
-        if data_source and monitor:
-            self.config[CONFIG_KEY_DATA_SOURCE][monitor] = data_source
-        self.config[CONFIG_KEY_DATA_SOURCE]["Default"] = data_source  # always update default source
+        # Preserve the saved source when reload() restarts the current player.
+        # In particular, do not replace Default with None during startup.
+        if data_source is not None:
+            if monitor is not None:
+                self.config[CONFIG_KEY_DATA_SOURCE][monitor] = data_source
+            self.config[CONFIG_KEY_DATA_SOURCE]["Default"] = data_source
+        self._save_config()
 
         # Quit current then create a new player
         self._quit_player()
@@ -141,11 +143,11 @@ class HidamariServer:
             self.player_process = None
 
         if mode in [MODE_VIDEO, MODE_STREAM]:
-            self.player_process = Process(
+            self.player_process = self.mp_context.Process(
                 name=f"hidamari-player-{self._player_count}", target=video_player_main
             )
         elif mode == MODE_WEBPAGE:
-            self.player_process = Process(
+            self.player_process = self.mp_context.Process(
                 name=f"hidamari-player-{self._player_count}", target=web_player_main
             )
         elif mode == MODE_NULL:
@@ -165,7 +167,7 @@ class HidamariServer:
                     if self.sys_icon_process.is_alive():
                         self.sys_icon_process.kill()
                         self.sys_icon_process.join(timeout=1)
-                self.sys_icon_process = Process(
+                self.sys_icon_process = self.mp_context.Process(
                     name="hidamari-systray",
                     target=show_systray_icon,
                     args=(mode, self.localedir),
@@ -214,23 +216,30 @@ class HidamariServer:
             raise ValueError("[Server] Unknown mode")
 
     def feeling_lucky(self):
-        """Random play a video from the directory"""
+        """Choose a random local video for each connected monitor."""
+        file_list = get_video_paths()
+        if not file_list:
+            logger.info("[Server] No local videos are available for random selection")
+            return
+
         monitors = Monitors().get_monitors()
+        sources = self.config[CONFIG_KEY_DATA_SOURCE]
+        selected_default = None
         for monitor in monitors:
-            file_list = get_video_paths()
-            # Remove current data source from the random selection
-            if self.config[CONFIG_KEY_DATA_SOURCE][monitor] in file_list:
-                file_list.remove(self.config[CONFIG_KEY_DATA_SOURCE][monitor])
-            if file_list:
-                video_path = random.choice(file_list)
-                self.config[CONFIG_KEY_MODE] = MODE_VIDEO
-                self.config[CONFIG_KEY_DATA_SOURCE][monitor] = video_path
-                self._save_config()
-            self.video(video_path)
+            current = sources.get(monitor)
+            candidates = [path for path in file_list if path != current] or file_list
+            selected_default = random.choice(candidates)
+            sources[monitor] = selected_default
+
+        if selected_default is None:
+            selected_default = random.choice(file_list)
+        sources["Default"] = selected_default
+        self.config[CONFIG_KEY_MODE] = MODE_VIDEO
+        self._setup_player(MODE_VIDEO)
 
     def show_gui(self):
         """Show main GUI"""
-        self.gui_process = Process(
+        self.gui_process = self.mp_context.Process(
             name="hidamari-gui",
             target=gui_main,
             args=(

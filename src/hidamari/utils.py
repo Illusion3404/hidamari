@@ -1,8 +1,11 @@
+import copy
 import gettext
 import json
 import locale
 import logging
+import math
 import os
+import tempfile
 from pprint import pformat
 
 import gi
@@ -17,13 +20,26 @@ from hidamari.commons import (
     AUTOSTART_DESKTOP_PATH,
     AUTOSTART_DIR,
     CONFIG_DIR,
+    CONFIG_KEY_BLUR_RADIUS,
     CONFIG_KEY_DATA_SOURCE,
+    CONFIG_KEY_FADE_DURATION_SEC,
+    CONFIG_KEY_FADE_INTERVAL,
+    CONFIG_KEY_FIRST_TIME,
+    CONFIG_KEY_MODE,
+    CONFIG_KEY_MUTE,
     CONFIG_KEY_MUTE_WHEN_MAXIMIZED,
+    CONFIG_KEY_PAUSE_WHEN_MAXIMIZED,
+    CONFIG_KEY_STATIC_WALLPAPER,
+    CONFIG_KEY_SYSTRAY,
+    CONFIG_KEY_VOLUME,
     CONFIG_PATH,
     CONFIG_TEMPLATE,
     CONFIG_VERSION,
     LOGGER_NAME,
+    MODE_NULL,
+    MODE_STREAM,
     MODE_VIDEO,
+    MODE_WEBPAGE,
     TRANSLATION_DOMAIN,
     VIDEO_WALLPAPER_DIR,
 )
@@ -357,117 +373,186 @@ class WindowHandler:
 
 
 class ConfigUtil:
+    @staticmethod
+    def _template():
+        # CONFIG_TEMPLATE is also used as a module-level default. Never return
+        # its nested monitor dictionary by reference: callers mutate configs.
+        return copy.deepcopy(CONFIG_TEMPLATE)
+
     def generate_template(self):
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        self.save(CONFIG_TEMPLATE)
+        config = self._template()
+        self.save(config)
+        return config
 
     @staticmethod
     def _check(config: dict):
-        """Check if the config is valid"""
-        is_all_keys_match = all(key in config for key in CONFIG_TEMPLATE)
-        is_version_match = config.get("version") == CONFIG_VERSION
-        return is_all_keys_match and is_version_match
+        """Reject malformed configuration before any runtime code uses it."""
+        if not isinstance(config, dict):
+            return False
+        if config.get("version") != CONFIG_VERSION:
+            return False
+        if not all(key in config for key in CONFIG_TEMPLATE):
+            return False
+        if config.get(CONFIG_KEY_MODE) not in (MODE_NULL, MODE_VIDEO, MODE_STREAM, MODE_WEBPAGE):
+            return False
+
+        data_sources = config.get(CONFIG_KEY_DATA_SOURCE)
+        if not isinstance(data_sources, dict):
+            return False
+        if any(not isinstance(value, (str, type(None))) for value in data_sources.values()):
+            return False
+
+        boolean_keys = (
+            CONFIG_KEY_MUTE,
+            CONFIG_KEY_STATIC_WALLPAPER,
+            CONFIG_KEY_PAUSE_WHEN_MAXIMIZED,
+            CONFIG_KEY_MUTE_WHEN_MAXIMIZED,
+            CONFIG_KEY_SYSTRAY,
+            CONFIG_KEY_FIRST_TIME,
+        )
+        if any(type(config.get(key)) is not bool for key in boolean_keys):
+            return False
+        if (
+            type(config.get(CONFIG_KEY_VOLUME)) is not int
+            or not 0 <= config[CONFIG_KEY_VOLUME] <= 100
+        ):
+            return False
+        if (
+            type(config.get(CONFIG_KEY_BLUR_RADIUS)) is not int
+            or not 0 <= config[CONFIG_KEY_BLUR_RADIUS] <= 20
+        ):
+            return False
+        for key in (CONFIG_KEY_FADE_DURATION_SEC, CONFIG_KEY_FADE_INTERVAL):
+            value = config.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                return False
+        return True
 
     def _invalid(self):
-        logger.debug("[Config] Invalid. A new config will be generated.")
-        self.generate_template()
-        return CONFIG_TEMPLATE
+        logger.warning("[Config] Invalid configuration. Generating a fresh one.")
+        return self.generate_template()
 
     def _migrateV3To4(self, config: dict):
-        logger.debug("[Config] Migration from version 3 to 4.")
-        curr_data_source = config["data_source"]
-        config["data_source"] = CONFIG_TEMPLATE[CONFIG_KEY_DATA_SOURCE]
-        config["data_source"]["Default"] = curr_data_source
-        config["is_pause_when_maximized"] = config["is_detect_maximized"]
-        del config["is_detect_maximized"]
-        config["is_mute_when_maximized"] = CONFIG_TEMPLATE[CONFIG_KEY_MUTE_WHEN_MAXIMIZED]
-        config["version"] = 4
-        # save config file
-        self.save(config)
+        logger.info("[Config] Migrating configuration from version 3 to 4")
+        migrated = self._template()
+        for key in migrated:
+            if key in config and key not in (CONFIG_KEY_DATA_SOURCE, "version"):
+                migrated[key] = config[key]
+
+        old_source = config.get(CONFIG_KEY_DATA_SOURCE, "")
+        data_sources = migrated[CONFIG_KEY_DATA_SOURCE]
+        if isinstance(old_source, dict):
+            data_sources.update(
+                {key: value for key, value in old_source.items() if isinstance(value, str)}
+            )
+        elif isinstance(old_source, str):
+            data_sources["Default"] = old_source
+        migrated[CONFIG_KEY_DATA_SOURCE] = data_sources
+        migrated[CONFIG_KEY_PAUSE_WHEN_MAXIMIZED] = config.get(
+            "is_detect_maximized", migrated[CONFIG_KEY_PAUSE_WHEN_MAXIMIZED]
+        )
+        migrated[CONFIG_KEY_MUTE_WHEN_MAXIMIZED] = CONFIG_TEMPLATE[CONFIG_KEY_MUTE_WHEN_MAXIMIZED]
+        migrated["version"] = CONFIG_VERSION
+        self.save(migrated)
+        return migrated
 
     def _checkMissingMonitors(self, old_config: dict, template: dict):
-        # Extract the monitors from both configurations
-        old_monitors = old_config.get("data_source", {}).keys()
-        template_monitors = template.get("data_source", {}).keys()
-        # Find monitors in the template that are not in the old configuration
-        missing_monitors = set(template_monitors) - set(old_monitors)
-        if len(missing_monitors) > 0:
-            logger.warning(
-                f"[Config] There are missing {len(missing_monitors)} monitors in config. Creating default one"
-            )
-            self._createMissingMonitors(missing_monitors, old_config)
-
-    def _createMissingMonitors(self, keys: set, config: dict):
-        # we will set to Default new monitor sources
-        for key in keys:
-            config["data_source"][key] = config["data_source"]["Default"]
-        self.save(config)
+        data_sources = old_config.get(CONFIG_KEY_DATA_SOURCE)
+        if not isinstance(data_sources, dict):
+            return
+        missing_monitors = set(template[CONFIG_KEY_DATA_SOURCE]) - set(data_sources)
+        if missing_monitors:
+            logger.info("[Config] Adding defaults for %s new monitor(s)", len(missing_monitors))
+            for key in missing_monitors:
+                data_sources[key] = data_sources.get("Default", "")
+            self.save(old_config)
 
     def _checkDefaultSource(self, config: dict):
-        # Check if the 'Default' source is empty
-        default_source = config["data_source"].get("Default", "")
-        mode = config.get("mode")
-        if mode == MODE_VIDEO and not os.path.isfile(default_source):
-            logger.warning(
-                "[Config] Default source is empty or not a valid file. Setting to the first on available."
-            )
+        data_sources = config.get(CONFIG_KEY_DATA_SOURCE, {})
+        default_source = data_sources.get("Default") or ""
+        if config.get("mode") != MODE_VIDEO or (default_source and os.path.isfile(default_source)):
+            return
 
-            # Get all values from the 'data_source' dictionary
-            values = list(config["data_source"].values())
-            # If there are no values in 'data_source', return early
-            if not values:
+        logger.info("[Config] Default video is missing; searching configured monitor sources")
+        for value in data_sources.values():
+            if isinstance(value, str) and value and os.path.isfile(value):
+                data_sources["Default"] = value
+                self.save(config)
                 return
-
-            # Set the 'Default' source to the first value available
-            for value in values:
-                if len(value) > 0 and os.path.isfile(value):
-                    config["data_source"]["Default"] = value
-                    self.save(config)
-                    break
 
     def load(self):
         if os.path.isfile(CONFIG_PATH):
-            with open(CONFIG_PATH) as f:
-                json_str = f.read()
-                try:
-                    config = json.loads(json_str)
-                    # migration to version 4 for data_source type change
-                    if config.get("version") <= 3 and CONFIG_VERSION >= 4:
-                        self._migrateV3To4(config)
-                    self._checkDefaultSource(config)
-                    self._checkMissingMonitors(config, CONFIG_TEMPLATE)
-                    if self._check(config):
-                        logs = []
-                        logs.append("--------- Config ---------")
-                        logs.append(pformat(config, indent=3))
-                        logs.append("--------------------------")
-                        logs_str = "\n".join(logs)
-                        logger.debug(f"[Config] Loaded {CONFIG_PATH}\n{logs_str}")
-                        return config
-                except json.decoder.JSONDecodeError:
-                    logger.debug("[Config] JSONDecodeError")
+            try:
+                with open(CONFIG_PATH, encoding="utf-8") as file:
+                    config = json.load(file)
+            except (OSError, UnicodeError, json.decoder.JSONDecodeError) as error:
+                logger.warning("[Config] Could not read %s: %s", CONFIG_PATH, error)
+                return self._invalid()
+
+            if not isinstance(config, dict):
+                return self._invalid()
+            if config.get("version") == 3:
+                config = self._migrateV3To4(config)
+            if not self._check(config):
+                return self._invalid()
+
+            # The old player could have written null when no source was passed
+            # during startup. Treat that as an empty selection, not a corrupt
+            # entire profile.
+            data_sources = config[CONFIG_KEY_DATA_SOURCE]
+            for key, value in tuple(data_sources.items()):
+                if value is None:
+                    data_sources[key] = ""
+            self._checkDefaultSource(config)
+            self._checkMissingMonitors(config, self._template())
+
+            logs = [
+                "--------- Config ---------",
+                pformat(config, indent=3),
+                "--------------------------",
+            ]
+            logger.debug("[Config] Loaded %s\n%s", CONFIG_PATH, "\n".join(logs))
+            return config
         return self._invalid()
 
     def save(self, config):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
         old_config = None
-        if os.path.isfile(CONFIG_PATH):
-            with open(CONFIG_PATH) as f:
-                json_str = f.read()
-                try:
-                    old_config = json.loads(json_str)
-                    if not self._check(old_config):
-                        old_config = None
-                except json.decoder.JSONDecodeError:
-                    old_config = None
-        # Skip if the config is identical
-        if old_config == config:
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as file:
+                old_config = json.load(file)
+        except (OSError, UnicodeError, json.decoder.JSONDecodeError):
+            pass
+
+        # Skip needless disk writes, but don't compare invalid/old config files.
+        if self._check(old_config) and old_config == config:
             return
-        with open(CONFIG_PATH, "w") as f:
-            json_str = json.dumps(config, indent=3)
-            print(json_str, file=f)
-            logs = []
-            logs.append("--------- Config ---------")
-            logs.append(pformat(config, indent=3))
-            logs.append("--------------------------")
-            logs_str = "\n".join(logs)
-            logger.debug(f"[Config] Saved {CONFIG_PATH}\n{logs_str}")
+
+        try:
+            json_str = json.dumps(config, indent=3) + "\n"
+            fd, temporary_path = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=CONFIG_DIR)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as file:
+                    file.write(json_str)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary_path, CONFIG_PATH)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
+        except OSError as error:
+            logger.error("[Config] Could not save %s: %s", CONFIG_PATH, error)
+            return
+
+        logs = [
+            "--------- Config ---------",
+            pformat(config, indent=3),
+            "--------------------------",
+        ]
+        logger.debug("[Config] Saved %s\n%s", CONFIG_PATH, "\n".join(logs))

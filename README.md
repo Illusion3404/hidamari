@@ -45,9 +45,11 @@ Hidamari offers similar feature as above, with additional features listed below:
 <sup>1</sup> Video frame can be applied as system wallpaper, look great in <i>GNOME</i> (currently GNOME exclusive, support for other DE might be added if requested...)  
 <sup>2</sup> Automatically pauses playback when maximized window or full screen mode is detected (currently X11 only...)  
 <sup>3</sup> Randomly select and play a video  
-<sup>4</sup> Use <i>vlc</i> as backend (currently HW acceleration doesn't work with Nvidia+Wayland combination...)     
+<sup>4</sup> Uses <i>vlc</i>; hardware decoding is optional and depends on the installed VA-API/VDPAU driver. Vulkan is not required.
 <sup>5</sup> Use <i>yt-dlp</i> as backend, tested with YouTube videos  
 <sup>6</sup> Theoretically it can be anything from a normal webpage to <i>Unity/Godot WebGL games</i>, be creative!
+
+> **Wayland note:** LibVLC is embedded through its X11 window API, so Hidamari uses XWayland in a Wayland session. XWayland must be installed/enabled; maximized-window detection remains X11-only. Hidamari does not require Vulkan.
 
 ## Installation ⏬
 ### Flatpak 📦
@@ -71,6 +73,26 @@ These are maintained by the community!
 | Distro     | URL                                     | Maintainer                            |
 |------------|-----------------------------------------|---------------------------------------|
 | Arch Linux | [![AUR](https://img.shields.io/aur/version/hidamari?style=for-the-badge)](https://aur.archlinux.org/packages/hidamari) | None |
+
+### CachyOS / Arch Linux graphics notes
+
+Hidamari runs on Arch-based systems and does **not** need Vulkan. For an AMD APU such as the Radeon HD 8650G, VLC can use Mesa VA-API for supported codecs (notably H.264) when the legacy GPU driver exposes those decode profiles. The application falls back to VLC's normal decoder selection if acceleration is unavailable.
+
+On CachyOS, install the native AUR package (`yay -S hidamari` or your preferred AUR helper), or follow the [native build and VA-API setup guide](docs/dev.md#cachyos--arch-linux-native-setup). In a Wayland session, make sure XWayland is enabled.
+
+For older/low-power hardware, try selecting **H.264/AVC**, 720p, and 30 fps videos. For streams, Hidamari prefers H.264 and avoids choosing a resolution above the display. To further limit stream resolution, quit Hidamari and start it with:
+
+```bash
+HIDAMARI_STREAM_MAX_HEIGHT=720 hidamari
+```
+
+To inspect the graphics stack without starting the GUI, run:
+
+```bash
+hidamari --diagnostics
+```
+
+`--diagnostics` reports the detected Linux session, DRM render devices, VA-API decode profiles, and VLC libraries.
 
 ## Screenshot 📸
 

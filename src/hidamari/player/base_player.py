@@ -12,6 +12,7 @@ from gi.repository import Gdk, Gio, Gtk
 from pydbus import SessionBus
 
 from hidamari.commons import DBUS_NAME_PLAYER, LOGGER_NAME, PROJECT
+from hidamari.monitor import get_monitor_name
 from hidamari.utils import gnome_desktop_icon_workaround
 
 logger = logging.getLogger(LOGGER_NAME)
@@ -46,6 +47,7 @@ class BasePlayer(Gtk.Application):
         )
         setproctitle.setproctitle(mp.current_process().name)
         self.windows = dict()
+        self.monitor_names = {}
         self._monitor_detect()
 
     def _monitor_detect(self):
@@ -56,6 +58,9 @@ class BasePlayer(Gtk.Application):
             monitor = display.get_monitor(i)
             if monitor not in self.windows:
                 self.windows[monitor] = None
+                self.monitor_names[monitor] = get_monitor_name(
+                    monitor, i, self.monitor_names.values()
+                )
 
         screen.connect("size-changed", self._on_size_changed)
         display.connect("monitor-added", self._on_monitor_added)
@@ -68,20 +73,34 @@ class BasePlayer(Gtk.Application):
 
     def _on_size_changed(self, *args):
         logger.info("[Player] size-changed")
-        for monitor in self.windows:
+        for monitor, window in self.windows.items():
+            if window is None:
+                continue
             rect = monitor.get_geometry()
             x, y, width, height = rect.x, rect.y, rect.width, rect.height
-            monitor.win_resize(width, height)
-            monitor.win_move(x, y)
+            if hasattr(window, "update_geometry"):
+                window.update_geometry(width, height)
+            else:
+                window.resize(width, height)
+            window.move(x, y)
 
     def _on_monitor_added(self, _, gdk_monitor, *args):
         logger.info("[Player] monitor-added")
         self.windows[gdk_monitor] = None
+        self.monitor_names[gdk_monitor] = get_monitor_name(
+            gdk_monitor, len(self.monitor_names), self.monitor_names.values()
+        )
         self.do_activate()
 
     def _on_monitor_removed(self, _, gdk_monitor, *args):
         logger.info("[Player] monitor-removed")
-        del self.windows[gdk_monitor]
+        window = self.windows.pop(gdk_monitor, None)
+        self.monitor_names.pop(gdk_monitor, None)
+        if window is not None:
+            cleanup = getattr(window, "cleanup", None)
+            if cleanup:
+                cleanup()
+            window.destroy()
 
     def do_startup(self):
         Gtk.Application.do_startup(self)

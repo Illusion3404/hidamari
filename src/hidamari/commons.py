@@ -1,5 +1,6 @@
 import os
 import subprocess
+from pathlib import Path
 
 LOGGER_NAME = "Hidamari"
 
@@ -10,14 +11,21 @@ DBUS_NAME_PLAYER = f"{PROJECT}.player"
 # gettext text domain (matches po/meson.build and the installed hidamari.mo)
 TRANSLATION_DOMAIN = "hidamari"
 
-HOME = os.environ.get("HOME")
+HOME = os.environ.get("HOME") or str(Path.home())
 try:
-    xdg_video_dir = subprocess.check_output(
-        "xdg-user-dir VIDEOS", shell=True, encoding="UTF-8"
-    ).replace("\n", "")
+    result = subprocess.run(
+        ["xdg-user-dir", "VIDEOS"],
+        check=True,
+        capture_output=True,
+        encoding="UTF-8",
+        timeout=3,
+    )
+    xdg_video_dir = result.stdout.strip()
+    if not xdg_video_dir:
+        raise ValueError("xdg-user-dir returned an empty path")
     VIDEO_WALLPAPER_DIR = os.path.join(xdg_video_dir, "Hidamari")
-except FileNotFoundError:
-    # xdg-user-dir not found, use $HOME/Hidamari for Video directory instead
+except (OSError, subprocess.SubprocessError, ValueError):
+    # xdg-user-dir is optional (and can fail before user-dirs are configured).
     VIDEO_WALLPAPER_DIR = os.path.join(HOME, "Hidamari")
 
 xdg_config_home = os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config"))

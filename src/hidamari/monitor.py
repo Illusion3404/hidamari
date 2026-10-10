@@ -4,6 +4,18 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk
 
 
+def get_monitor_name(monitor, index=0, existing_names=()):
+    """Return a stable, non-empty key for a GDK monitor."""
+    model = monitor.get_model()
+    base_name = model or monitor.get_manufacturer() or f"Monitor {index + 1}"
+    name = base_name
+    suffix = 2
+    while name in existing_names:
+        name = f"{base_name} ({suffix})"
+        suffix += 1
+    return name
+
+
 class Monitor:
     def __init__(self, name, width=0, height=0, x=0, y=0, is_primary=False, wallpaper=None):
         self.width = width
@@ -25,11 +37,13 @@ class MonitorInfo:
     @staticmethod
     def get_unique_monitor_count():
         display = Gdk.Display.get_default()
-        return display.get_n_monitors()
+        return display.get_n_monitors() if display is not None else 0
 
     @staticmethod
     def monitors():
         display = Gdk.Display.get_default()
+        if display is None:
+            return []
         n_monitors = display.get_n_monitors()
         monitors = []
 
@@ -38,7 +52,7 @@ class MonitorInfo:
             geometry = monitor.get_geometry()
             width_mm = monitor.get_width_mm()
             height_mm = monitor.get_height_mm()
-            name = monitor.get_model()
+            name = get_monitor_name(monitor, i, (item["name"] for item in monitors))
             is_primary = monitor.is_primary()
 
             monitors.append(
@@ -78,7 +92,7 @@ class Monitors:
             if monitor.is_primary:
                 return monitor
 
-        return self.monitors.items[0]
+        return next(iter(self.monitors.values()), None)
 
     def get_primary_monitor_index(self):
         for i, (_model, monitor) in enumerate(self.monitors.items()):

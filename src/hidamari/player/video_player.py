@@ -36,6 +36,7 @@ from hidamari.commons import (
 )
 from hidamari.menu import build_menu
 from hidamari.player.base_player import BasePlayer
+from hidamari.player.video_options import build_vlc_options
 from hidamari.utils import (
     ActiveHandler,
     ConfigUtil,
@@ -56,6 +57,53 @@ else:
     from hidamari.utils import WindowHandler
 
 
+def _probe_video_dimensions(path):
+    """Read a local video's dimensions without letting broken files stall startup."""
+    if not path or not os.path.isfile(path):
+        return None, None
+    try:
+        output = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=s=x:p=0",
+                path,
+            ],
+            stderr=subprocess.DEVNULL,
+            encoding="UTF-8",
+            timeout=10,
+        ).strip()
+        width, height = output.split("x", 1)
+        return int(width), int(height)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        logger.debug("[VideoProbe] Could not read dimensions for %s: %s", path, error)
+        return None, None
+
+
+def _stream_target_height(windows):
+    """Cap high-resolution streams to avoid wasting decode work on wallpaper."""
+    display_heights = [monitor.get_geometry().height for monitor in windows]
+    display_height = max((height for height in display_heights if height > 0), default=720)
+    configured = os.environ.get("HIDAMARI_STREAM_MAX_HEIGHT")
+    if configured is not None:
+        try:
+            target_height = int(configured)
+            if target_height < 1:
+                raise ValueError
+            return min(display_height, target_height)
+        except ValueError:
+            logger.warning("[Stream] Ignoring invalid HIDAMARI_STREAM_MAX_HEIGHT=%r", configured)
+    # 1080p is a sensible ceiling for a desktop wallpaper; users with capable
+    # systems can raise it with HIDAMARI_STREAM_MAX_HEIGHT.
+    return min(display_height, 1080)
+
+
 class Fade:
     def __init__(self):
         self.timer = None
@@ -73,6 +121,13 @@ class Fade:
         # Cancel any existing timer first
         self.cancel()
         self.is_active = True
+        if cur == target or step == 0:
+            if update_callback:
+                update_callback(int(target))
+            if complete_callback:
+                complete_callback()
+            self.is_active = False
+            return
         self._fade_step(cur, target, step, fade_interval, update_callback, complete_callback)
 
     def _fade_step(self, cur, target, step, fade_interval, update_callback, complete_callback):
@@ -117,13 +172,11 @@ class VLCWidget(Gtk.DrawingArea):
     def __init__(self, width, height):
         Gtk.DrawingArea.__init__(self)
 
-        # Spawn a VLC instance and create a new media player to embed.
-        # Some options need to be specified when instantiating VLC.
-        # --no-disable-screensaver: Allow screensaver.
-        # --aout=pulse: Force PulseAudio output. VLC's PipeWire audio-output
-        #   plugin segfaults (pw_thread_loop_lock) when multiple instances are
-        #   active, e.g. one per monitor. See the Flatpak, which uses Pulse too.
-        vlc_options = ["--no-disable-screensaver", "--aout=pulse"]
+        # Spawn a VLC instance and create a new media player to embed. Keep
+        # decode selection automatic unless a user explicitly overrides it:
+        # Hidamari does not require Vulkan, and VA-API is optional on Linux.
+        vlc_options = build_vlc_options()
+        logger.info("[VLCWidget] LibVLC options: %s", vlc_options)
         self.instance = vlc.Instance(vlc_options)
         self.player = self.instance.media_player_new()
 
@@ -170,6 +223,15 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         self.menu = None
         self.connect("button-press-event", self._on_button_press_event)
+
+    def update_geometry(self, width, height):
+        self.width = width
+        self.height = height
+        self.__vlc_widget.set_size_request(width, height)
+        self.resize(width, height)
+        # Recompute center-crop for the new monitor dimensions once VLC knows
+        # the decoded frame size.
+        self.centercrop()
 
     def play(self):
         self.__vlc_widget.player.play()
@@ -364,7 +426,8 @@ class VideoPlayer(BasePlayer):
 
     def new_window(self, gdk_monitor):
         rect = gdk_monitor.get_geometry()
-        return PlayerWindow(gdk_monitor.get_model(), rect.width, rect.height, application=self)
+        name = self.monitor_names.get(gdk_monitor, gdk_monitor.get_model() or "Monitor")
+        return PlayerWindow(name, rect.width, rect.height, application=self)
 
     def do_activate(self):
         super().do_activate()
@@ -433,88 +496,72 @@ class VideoPlayer(BasePlayer):
 
     @data_source.setter
     def data_source(self, data_source):
-        self.config[CONFIG_KEY_DATA_SOURCE] = data_source
+        sources = data_source if isinstance(data_source, dict) else {}
+        self.config[CONFIG_KEY_DATA_SOURCE] = sources
 
         if self.mode == MODE_VIDEO:
-            # Get the dimension of the video
-            video_width, video_height = {}, {}
-            try:
-                for monitor, video in data_source.items():
-                    # fallback to Default video
-                    if len(video) == 0:
-                        video = data_source["Default"]
-                    dimension = subprocess.check_output(
-                        [
-                            "ffprobe",
-                            "-v",
-                            "error",
-                            "-select_streams",
-                            "v:0",
-                            "-show_entries",
-                            "stream=width,height",
-                            "-of",
-                            "csv=s=x:p=0",
-                            video,
-                        ],
-                        shell=False,
-                        encoding="UTF-8",
-                    ).replace("\n", "")
-                    dimension = dimension.split("x")
-                    video_width[monitor] = int(dimension[0])
-                    video_height[monitor] = int(dimension[1])
-            except subprocess.CalledProcessError:
-                for monitor, _video in data_source.items():
-                    video_width.setdefault(monitor, None)
-                    video_height.setdefault(monitor, None)
+            default_source = sources.get("Default") or ""
+            if not default_source:
+                logger.warning("[Video] No local video is selected")
+                self.set_original_wallpaper()
+                return
+
+            # Probe each distinct file once; a per-monitor configuration often
+            # points multiple displays at the same video.
+            dimensions = {}
+            for source in set(value for value in sources.values() if value):
+                dimensions[source] = _probe_video_dimensions(source)
 
             for monitor, window in self.windows.items():
-                source = (
-                    data_source[monitor.get_model()]
-                    if monitor.get_model() in data_source
-                    and len(data_source[monitor.get_model()]) != 0
-                    else data_source["Default"]
-                )
-                logger.info(f"Setting source {source} to {monitor.get_model()}")
+                model = self.monitor_names.get(monitor, monitor.get_model() or "Monitor")
+                source = sources.get(model) or default_source
+                if not source:
+                    continue
+                logger.info("Setting source %s to %s", source, model)
                 media = window.media_new(source)
-                """
-                This loops the media itself. Using -R / --repeat and/or -L / --loop don't seem to work. However,
-                based on reading, this probably only repeats 65535 times, which is still a lot of time, but might
-                cause the program to stop playback if it's left on for a very long time.
-                """
+                # Repeat the media itself. LibVLC's --repeat/--loop options do
+                # not reliably loop an embedded media player.
                 media.add_option("input-repeat=65535")
-                # Prevent awful ear-rape with multiple instances.
+                # Only the primary display emits audio.
                 if not monitor.is_primary():
                     media.add_option("no-audio")
                 window.set_media(media)
                 window.set_position(0.0)
-                if (
-                    monitor.get_model() not in data_source
-                    or len(data_source[monitor.get_model()]) == 0
-                ):
-                    window.centercrop(video_width["Default"], video_height["Default"])
-                else:
-                    window.centercrop(
-                        video_width[monitor.get_model()], video_height[monitor.get_model()]
-                    )
+                width, height = dimensions.get(source, (None, None))
+                window.centercrop(width, height)
 
         elif self.mode == MODE_STREAM:
-            source = data_source["Default"]
-            formats = get_formats(source)
-            max_height = (
-                max(self.windows, key=lambda m: m.get_geometry().height).get_geometry().height
-            )
-            video_url, video_width, video_height = get_optimal_video(formats, max_height)
-            audio_url = get_best_audio(formats)
+            source = sources.get("Default")
+            if not source:
+                logger.warning("[Stream] No stream URL is configured")
+                return
+            try:
+                formats = get_formats(source)
+                max_height = _stream_target_height(self.windows)
+                video_url, video_width, video_height = get_optimal_video(formats, max_height)
+                audio_url = get_best_audio(formats)
+            except Exception:
+                # A stale URL, a removed format, or a temporary network failure
+                # should not crash the GTK player process.
+                logger.exception("[Stream] Could not prepare stream: %s", source)
+                return
 
+            logger.info(
+                "[Stream] Selected %sx%s video at or below %sp; H.264 is preferred when available",
+                video_width,
+                video_height,
+                max_height,
+            )
             for monitor, window in self.windows.items():
                 media = window.media_new(video_url)
                 media.add_option("input-repeat=65535")
-                window.set_media(media)
-                if monitor.is_primary():
-                    window.add_audio_track(audio_url)
-                else:
-                    # `get_optimal_video` now might return video with audio.
+                if not monitor.is_primary():
+                    # Some streaming formats include audio; avoid duplicate
+                    # audio playback on secondary monitors.
                     media.add_option("no-audio")
+                window.set_media(media)
+                if monitor.is_primary() and audio_url:
+                    window.add_audio_track(audio_url)
                 window.set_position(0.0)
                 window.centercrop(video_width, video_height)
         else:
@@ -528,7 +575,7 @@ class VideoPlayer(BasePlayer):
         if not self.active_handler:
             self.active_handler = ActiveHandler(self._on_active_changed)
         if not self.window_handler and not is_wayland():
-            # Only create WindowHandler on X11, not Wayland
+            # Only create WindowHandler on X11, not Wayland.
             self.window_handler = WindowHandler(self._on_window_state_changed)
 
         if self.config[CONFIG_KEY_STATIC_WALLPAPER] and self.mode == MODE_VIDEO:
@@ -580,24 +627,31 @@ class VideoPlayer(BasePlayer):
 
     def monitor_sync(self):
         primary_monitor = None
-        for monitor, _window in self.windows.items():
-            if monitor.is_primary:
+        for monitor in self.windows:
+            if monitor.is_primary():
                 primary_monitor = monitor
                 break
         if primary_monitor:
+            primary_window = self.windows[primary_monitor]
             for monitor, window in self.windows.items():
-                if monitor == primary_monitor:
+                if monitor == primary_monitor or window is None:
                     continue
-                # `set_position()` method require the playback to be enabled before calling
+                # LibVLC requires playback to be enabled before seeking.
                 window.play()
-                window.set_position(self.windows[primary_monitor].get_position())
-                window.play() if self.windows[primary_monitor].is_playing() else window.pause()
+                window.set_position(primary_window.get_position())
+                if primary_window.is_playing():
+                    window.play()
+                else:
+                    window.pause()
 
     def set_static_wallpaper(self):
         # Currently for GNOME only
         if not is_gnome():
             return
         # Get the duration of the video
+        source = self.data_source.get("Default")
+        if not source or not os.path.isfile(source):
+            return
         try:
             duration = float(
                 subprocess.check_output(
@@ -609,41 +663,62 @@ class VideoPlayer(BasePlayer):
                         "format=duration",
                         "-of",
                         "default=noprint_wrappers=1:nokey=1",
-                        self.data_source["Default"],
+                        source,
                     ],
-                    shell=False,
+                    encoding="UTF-8",
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
                 )
             )
-        except subprocess.CalledProcessError:
-            duration = 0
-        # Find the golden ratio
-        ss = time.strftime("%H:%M:%S", time.gmtime(duration / 3.14))
-        # Extract the frame
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            logger.warning("[StaticWallpaper] Could not read video duration: %s", error)
+            return
+        # Find a representative point in the video.
+        ss = time.strftime("%H:%M:%S", time.gmtime(max(0, duration) / 3.14))
         static_wallpaper_path = os.path.join(
             CONFIG_DIR, f"static-{random.randint(0, 999999):06d}.png"
         )
-        ret = subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                ss,
-                "-i",
-                self.data_source["Default"],
-                "-vframes",
-                "1",
-                static_wallpaper_path,
-            ],
-            shell=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
+        display_width = max(
+            (monitor.get_geometry().width for monitor in self.windows), default=1280
         )
-        if ret.returncode == 0 and os.path.isfile(static_wallpaper_path):
-            blur_wallpaper = Image.open(static_wallpaper_path)
-            blur_wallpaper = blur_wallpaper.filter(
-                ImageFilter.GaussianBlur(self.config["static_wallpaper_blur_radius"])
+        display_height = max(
+            (monitor.get_geometry().height for monitor in self.windows), default=720
+        )
+        target_width = max(1, min(display_width, 1920))
+        target_height = max(1, min(display_height, 1080))
+        try:
+            ret = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    ss,
+                    "-i",
+                    source,
+                    "-vf",
+                    f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease",
+                    "-frames:v",
+                    "1",
+                    static_wallpaper_path,
+                ],
+                check=False,
+                timeout=30,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
             )
-            blur_wallpaper.save(static_wallpaper_path)
+        except (OSError, subprocess.SubprocessError) as error:
+            logger.warning("[StaticWallpaper] Frame extraction failed: %s", error)
+            return
+        if ret.returncode == 0 and os.path.isfile(static_wallpaper_path):
+            try:
+                with Image.open(static_wallpaper_path) as image:
+                    blur_wallpaper = image.filter(
+                        ImageFilter.GaussianBlur(self.config["static_wallpaper_blur_radius"])
+                    )
+                    blur_wallpaper.save(static_wallpaper_path)
+            except OSError as error:
+                logger.warning("[StaticWallpaper] Could not process extracted frame: %s", error)
+                return
             static_wallpaper_uri = pathlib.Path(static_wallpaper_path).resolve().as_uri()
             if is_flatpak():
                 try:
@@ -706,7 +781,7 @@ class VideoPlayer(BasePlayer):
                             "set",
                             "org.gnome.desktop.background",
                             "picture-uri-dark",
-                            self.original_wallpaper_uri,
+                            self.original_wallpaper_uri_dark,
                         ],
                         shell=False,
                     )
